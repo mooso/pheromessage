@@ -1,0 +1,10 @@
+[package]
+name = "pheromessage"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mostafa Elhemali"]
+description = "Implementation of gossip protocol for keeping an eventually consistent data structure"
+license = "MIT"
+
+[dependencies]
+rand = { version = "0.8" }
