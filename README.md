@@ -1,4 +1,4 @@
-= Overview =
+# Overview
 
 This is a library to implement gossip algorithms for a large network of nodes to update a shared data structure through gossip. It implements uniform gossip, and a priority gossip
 algorithm described in the paper:
