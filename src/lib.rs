@@ -20,9 +20,23 @@ pub trait Gossip<M> {
 }
 
 /// A message that can update shared data.
-pub trait Message<I> {
+pub trait Message {
+    type I;
+
     /// The unique ID of the message.
-    fn id(&self) -> I;
+    fn id(&self) -> Self::I;
+}
+
+/// Implement `Message` for any primitive type that is `Eq + Hash + Copy` to have itself as ID.
+impl<T> Message for T
+where
+    T: Eq + Hash + Copy,
+{
+    type I = Self;
+
+    fn id(&self) -> Self {
+        *self
+    }
 }
 
 /// A shared data structure that can be maintained through gossip.
@@ -47,7 +61,7 @@ pub struct UniformGossip<E, S, D, I> {
 
 impl<E, S, D, M, I> Gossip<M> for UniformGossip<E, S, D, I>
 where
-    M: Message<I>,
+    M: Message<I = I>,
     D: Delivery<M, E>,
     I: Eq + Hash,
     S: SharedData<M>,
@@ -127,7 +141,7 @@ impl<E, S, D, I> PreferentialGossip<E, S, D, I> {
 
 impl<E, S, D, M, I> Gossip<M> for PreferentialGossip<E, S, D, I>
 where
-    M: Message<I>,
+    M: Message<I = I>,
     D: Delivery<M, E>,
     I: Eq + Hash,
     S: SharedData<M>,
@@ -173,9 +187,9 @@ where
 /// Gossip the given `message` to a random subset of size `fanout` of `targets`.
 fn gossip<E, D, M, I>(delivery: &D, message: &M, targets: &Vec<E>, fanout: usize)
 where
-    M: Message<I>,
+    M: Message<I = I>,
     D: Delivery<M, E>,
-    I: Eq + std::hash::Hash,
+    I: Eq + Hash,
 {
     let mut rng = rand::thread_rng();
     let chosen = targets.choose_multiple(&mut rng, fanout);
@@ -192,13 +206,6 @@ mod tests {
 
     /// A "network" that just keeps track of which endpoints (keys) received which messages (values).
     struct Network(RefCell<HashMap<usize, Vec<usize>>>);
-
-    impl Message<usize> for usize {
-        fn id(&self) -> usize {
-            // The ID of a usize message is just itself.
-            *self
-        }
-    }
 
     impl Delivery<usize, usize> for Network {
         fn deliver(&self, message: &usize, endpoint: &usize) {
