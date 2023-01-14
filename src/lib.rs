@@ -4,6 +4,8 @@ use std::{
     hash::Hash,
 };
 
+pub mod data;
+
 /// Delivery mechanism for delivering messages (`M`) to endpoints (`E`).
 pub trait Delivery<M, E> {
     /// Deliver the given message to the given endpoint.
@@ -25,18 +27,6 @@ pub trait Message {
 
     /// The unique ID of the message.
     fn id(&self) -> Self::I;
-}
-
-/// Implement `Message` for any primitive type that is `Eq + Hash + Copy` to have itself as ID.
-impl<T> Message for T
-where
-    T: Eq + Hash + Copy,
-{
-    type I = Self;
-
-    fn id(&self) -> Self {
-        *self
-    }
 }
 
 /// A shared data structure that can be maintained through gossip.
@@ -214,6 +204,18 @@ mod tests {
                 .entry(*endpoint)
                 .or_default()
                 .push(*message);
+        }
+    }
+
+    /// Implement `Message` for any primitive type that is `Eq + Hash + Copy` to have itself as ID.
+    impl<T> Message for T
+    where
+        T: Eq + Hash + Copy,
+    {
+        type I = Self;
+
+        fn id(&self) -> Self {
+            *self
         }
     }
 
