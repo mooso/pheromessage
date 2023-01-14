@@ -1,5 +1,8 @@
 use rand::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::Hash,
+};
 
 /// Delivery mechanism for delivering messages (`M`) to endpoints (`E`).
 pub trait Delivery<M, E> {
@@ -46,15 +49,15 @@ impl<E, S, D, M, I> Gossip<M> for UniformGossip<E, S, D, I>
 where
     M: Message<I>,
     D: Delivery<M, E>,
-    I: Eq + std::hash::Hash,
+    I: Eq + Hash,
     S: SharedData<M>,
 {
     fn receive(&mut self, message: &M) {
         // Mark the message as seen
         let id = message.id();
-        let seen = self.seen_messages.insert(id);
+        let new = self.seen_messages.insert(id);
         // Only pass the message on if I've never seen it before, otherwise it's a repeat so throw it away.
-        if !seen {
+        if new {
             // This is the first time I see this message, update my data and pass it on.
             self.data.update(message);
             gossip(&self.delivery, message, &self.peers, self.fanout);
@@ -64,6 +67,8 @@ where
     fn update(&mut self, message: &M) {
         // Update my data.
         self.data.update(message);
+        // Mark it as seen.
+        self.seen_messages.insert(message.id());
         // Pass it on to my peers.
         gossip(&self.delivery, message, &self.peers, self.fanout);
     }
@@ -107,21 +112,29 @@ pub struct PreferentialGossip<E, S, D, I> {
     fanout: usize,
 }
 
+impl<E, S, D, I> PreferentialGossip<E, S, D, I> {
+    fn increment_seen(&mut self, message_id: I) -> SeenCount
+    where
+        I: Eq + Hash,
+    {
+        *self
+            .message_log
+            .entry(message_id)
+            .and_modify(|count| count.increment())
+            .or_insert(SeenCount::Once)
+    }
+}
+
 impl<E, S, D, M, I> Gossip<M> for PreferentialGossip<E, S, D, I>
 where
     M: Message<I>,
     D: Delivery<M, E>,
-    I: Eq + std::hash::Hash,
+    I: Eq + Hash,
     S: SharedData<M>,
 {
     fn receive(&mut self, message: &M) {
-        let id = message.id();
         // Update the amount of times I've seen this message.
-        let count_seen = *self
-            .message_log
-            .entry(id)
-            .and_modify(|count| count.increment())
-            .or_insert(SeenCount::Once);
+        let count_seen = self.increment_seen(message.id());
         if count_seen == SeenCount::Once {
             // This is the first time I've seen this message - update the data.
             self.data.update(message);
@@ -146,12 +159,13 @@ where
             None
         };
         if let Some(targets) = targets {
-            gossip(&self.delivery, &message, targets, self.fanout);
+            gossip(&self.delivery, message, targets, self.fanout);
         }
     }
 
     fn update(&mut self, message: &M) {
         self.data.update(message);
+        self.increment_seen(message.id());
         gossip(&self.delivery, message, &self.primaries, self.fanout);
     }
 }
