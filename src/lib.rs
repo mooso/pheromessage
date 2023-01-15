@@ -4,6 +4,7 @@ use std::{
     hash::Hash,
 };
 
+pub mod channel;
 pub mod data;
 
 /// Delivery mechanism for delivering messages (`M`) to endpoints (`E`).
@@ -38,15 +39,31 @@ pub trait SharedData<M> {
 /// A gossip mechanism that treats all peers equally in updating them.
 pub struct UniformGossip<E, S, D, I> {
     /// The set of peers.
-    peers: Vec<E>,
+    pub peers: Vec<E>,
     /// Set of all message IDs seen so far.
     seen_messages: HashSet<I>,
     /// The delivery mechanism to send gossip messages.
-    delivery: D,
+    pub delivery: D,
     /// The data being gossipped about.
-    data: S,
+    pub data: S,
     /// How many peers to reach out to when gossipping.
-    fanout: usize,
+    pub fanout: usize,
+}
+
+impl<E, S, D, I> UniformGossip<E, S, D, I> {
+    /// Create a new uniform gossip mechanism that will gossip to the given set of `peers`,
+    /// using the given `delivery` mechanism and maintaining the given `data`.
+    /// The gossip will be done using the given `fanout` - each message will be delivered
+    /// to a random subset of peers of that size.
+    pub fn create(peers: Vec<E>, fanout: usize, data: S, delivery: D) -> UniformGossip<E, S, D, I> {
+        UniformGossip {
+            peers,
+            seen_messages: HashSet::new(),
+            delivery,
+            data,
+            fanout,
+        }
+    }
 }
 
 impl<E, S, D, M, I> Gossip<M> for UniformGossip<E, S, D, I>
@@ -207,11 +224,8 @@ mod tests {
         }
     }
 
-    /// Implement `Message` for any primitive type that is `Eq + Hash + Copy` to have itself as ID.
-    impl<T> Message for T
-    where
-        T: Eq + Hash + Copy,
-    {
+    /// Implement `Message` for usize for testing purposes.
+    impl Message for usize {
         type I = Self;
 
         fn id(&self) -> Self {

@@ -6,7 +6,7 @@ use std::{collections::HashMap, hash::Hash};
 use crate::{Message, SharedData};
 
 /// An action to add/remove an item to a gossipped set.
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum GossipSetAction<T> {
     Add(T),
     Remove(T),
@@ -20,13 +20,21 @@ struct ItemActions {
 }
 
 /// A set of unique items maintained through gossip.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct GossipSet<T> {
     items: HashMap<T, ItemActions>,
 }
 
+impl<T> Default for GossipSet<T> {
+    fn default() -> Self {
+        Self {
+            items: HashMap::new(),
+        }
+    }
+}
+
 /// A message that can be used to ad/remove items from a gossipped set.
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct GossipSetMessage<T> {
     id: u128,
     pub action: GossipSetAction<T>,

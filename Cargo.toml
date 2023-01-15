@@ -8,3 +8,6 @@ license = "MIT"
 
 [dependencies]
 rand = { version = "0.8" }
+
+[dev-dependencies]
+rayon = { version = "1" }
