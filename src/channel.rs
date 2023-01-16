@@ -1,6 +1,6 @@
 //! Implementation of Gossip over local `mpsc` channels.
 
-use std::sync::mpsc;
+use std::sync::mpsc::{self, SendError};
 
 use crate::{
     data::{GossipSet, GossipSetMessage},
@@ -13,13 +13,12 @@ pub struct Channels();
 /// The singleton `Channels`.
 pub const CHANNELS: Channels = Channels();
 
-impl<M> Delivery<M, mpsc::Sender<M>> for Channels
+impl<M> Delivery<M, mpsc::Sender<M>, SendError<M>> for Channels
 where
     M: Clone,
 {
-    fn deliver(&self, message: &M, endpoint: &mpsc::Sender<M>) {
-        // TODO: Make Delivery trait have a result and use that.
-        let _ = endpoint.send(message.clone());
+    fn deliver(&self, message: &M, endpoint: &mpsc::Sender<M>) -> Result<(), SendError<M>> {
+        endpoint.send(message.clone())
     }
 }
 
@@ -133,14 +132,14 @@ mod tests {
                     let num_finished = n.2;
                     // First go through the work one by one.
                     while let Some(to_send) = work.pop() {
-                        node.gossip.update(&to_send);
+                        node.gossip.update(&to_send).unwrap();
                         // After sending it, busy-wait a random time before sending the next op.
                         let mut random_wait =
                             Duration::from_millis(thread_rng().gen_range(10..100));
                         let end_wait = Instant::now() + random_wait;
                         // Process the messages while waiting.
                         while let Ok(message) = node.receiver.recv_timeout(random_wait) {
-                            node.gossip.receive(&message);
+                            node.gossip.receive(&message).unwrap();
                             let now = Instant::now();
                             if now >= end_wait {
                                 break;
@@ -157,7 +156,7 @@ mod tests {
                     let poll_time = Duration::from_millis(1);
                     loop {
                         match node.receiver.recv_timeout(poll_time) {
-                            Ok(message) => node.gossip.receive(&message),
+                            Ok(message) => node.gossip.receive(&message).unwrap(),
                             Err(RecvTimeoutError::Disconnected) => break,
                             Err(RecvTimeoutError::Timeout) => {
                                 if num_finished.load(Ordering::Relaxed) >= num_nodes {

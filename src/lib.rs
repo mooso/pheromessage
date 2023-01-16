@@ -7,19 +7,19 @@ use std::{
 pub mod channel;
 pub mod data;
 
-/// Delivery mechanism for delivering messages (`M`) to endpoints (`E`).
-pub trait Delivery<M, E> {
+/// Delivery mechanism for delivering messages (`M`) to endpoints (`P`).
+pub trait Delivery<M, P, E> {
     /// Deliver the given message to the given endpoint.
-    fn deliver(&self, message: &M, endpoint: &E);
+    fn deliver(&self, message: &M, endpoint: &P) -> Result<(), E>;
 }
 
 /// A gossip mechanism for maintaining shared data and updating it by gossiping with peers.
-pub trait Gossip<M> {
+pub trait Gossip<M, E> {
     /// Indicate that the given message has been received from a peer.
-    fn receive(&mut self, message: &M);
+    fn receive(&mut self, message: &M) -> Result<(), E>;
 
     /// Update the data by the given message and gossip it.
-    fn update(&mut self, message: &M);
+    fn update(&mut self, message: &M) -> Result<(), E>;
 }
 
 /// A message that can update shared data.
@@ -37,9 +37,9 @@ pub trait SharedData<M> {
 }
 
 /// A gossip mechanism that treats all peers equally in updating them.
-pub struct UniformGossip<E, S, D, I> {
+pub struct UniformGossip<P, S, D, I> {
     /// The set of peers.
-    pub peers: Vec<E>,
+    pub peers: Vec<P>,
     /// Set of all message IDs seen so far.
     seen_messages: HashSet<I>,
     /// The delivery mechanism to send gossip messages.
@@ -50,12 +50,12 @@ pub struct UniformGossip<E, S, D, I> {
     pub fanout: usize,
 }
 
-impl<E, S, D, I> UniformGossip<E, S, D, I> {
+impl<P, S, D, I> UniformGossip<P, S, D, I> {
     /// Create a new uniform gossip mechanism that will gossip to the given set of `peers`,
     /// using the given `delivery` mechanism and maintaining the given `data`.
     /// The gossip will be done using the given `fanout` - each message will be delivered
     /// to a random subset of peers of that size.
-    pub fn create(peers: Vec<E>, fanout: usize, data: S, delivery: D) -> UniformGossip<E, S, D, I> {
+    pub fn create(peers: Vec<P>, fanout: usize, data: S, delivery: D) -> UniformGossip<P, S, D, I> {
         UniformGossip {
             peers,
             seen_messages: HashSet::new(),
@@ -66,14 +66,14 @@ impl<E, S, D, I> UniformGossip<E, S, D, I> {
     }
 }
 
-impl<E, S, D, M, I> Gossip<M> for UniformGossip<E, S, D, I>
+impl<P, S, D, M, I, E> Gossip<M, E> for UniformGossip<P, S, D, I>
 where
     M: Message<I = I>,
-    D: Delivery<M, E>,
+    D: Delivery<M, P, E>,
     I: Eq + Hash,
     S: SharedData<M>,
 {
-    fn receive(&mut self, message: &M) {
+    fn receive(&mut self, message: &M) -> Result<(), E> {
         // Mark the message as seen
         let id = message.id();
         let new = self.seen_messages.insert(id);
@@ -81,17 +81,18 @@ where
         if new {
             // This is the first time I see this message, update my data and pass it on.
             self.data.update(message);
-            gossip(&self.delivery, message, &self.peers, self.fanout);
+            gossip(&self.delivery, message, &self.peers, self.fanout)?;
         }
+        Ok(())
     }
 
-    fn update(&mut self, message: &M) {
+    fn update(&mut self, message: &M) -> Result<(), E> {
         // Update my data.
         self.data.update(message);
         // Mark it as seen.
         self.seen_messages.insert(message.id());
         // Pass it on to my peers.
-        gossip(&self.delivery, message, &self.peers, self.fanout);
+        gossip(&self.delivery, message, &self.peers, self.fanout)
     }
 }
 
@@ -116,11 +117,11 @@ impl SeenCount {
 
 /// A gossip mechanism that treats a subset of peers as primaries that should get priority
 /// in getting updates faster.
-pub struct PreferentialGossip<E, S, D, I> {
+pub struct PreferentialGossip<P, S, D, I> {
     /// The endpoints for all the primary peers.
-    primaries: Vec<E>,
+    primaries: Vec<P>,
     /// The endpoints for all the rest of the peers (not primary).
-    secondaries: Vec<E>,
+    secondaries: Vec<P>,
     /// Count of how often I've seen each message by ID.
     message_log: HashMap<I, SeenCount>,
     /// Whether I myself am primary or secondary.
@@ -133,7 +134,7 @@ pub struct PreferentialGossip<E, S, D, I> {
     fanout: usize,
 }
 
-impl<E, S, D, I> PreferentialGossip<E, S, D, I> {
+impl<P, S, D, I> PreferentialGossip<P, S, D, I> {
     fn increment_seen(&mut self, message_id: I) -> SeenCount
     where
         I: Eq + Hash,
@@ -146,14 +147,14 @@ impl<E, S, D, I> PreferentialGossip<E, S, D, I> {
     }
 }
 
-impl<E, S, D, M, I> Gossip<M> for PreferentialGossip<E, S, D, I>
+impl<P, S, D, M, I, E> Gossip<M, E> for PreferentialGossip<P, S, D, I>
 where
     M: Message<I = I>,
-    D: Delivery<M, E>,
+    D: Delivery<M, P, E>,
     I: Eq + Hash,
     S: SharedData<M>,
 {
-    fn receive(&mut self, message: &M) {
+    fn receive(&mut self, message: &M) -> Result<(), E> {
         // Update the amount of times I've seen this message.
         let count_seen = self.increment_seen(message.id());
         if count_seen == SeenCount::Once {
@@ -180,29 +181,36 @@ where
             None
         };
         if let Some(targets) = targets {
-            gossip(&self.delivery, message, targets, self.fanout);
+            gossip(&self.delivery, message, targets, self.fanout)?;
         }
+        Ok(())
     }
 
-    fn update(&mut self, message: &M) {
+    fn update(&mut self, message: &M) -> Result<(), E> {
         self.data.update(message);
         self.increment_seen(message.id());
-        gossip(&self.delivery, message, &self.primaries, self.fanout);
+        gossip(&self.delivery, message, &self.primaries, self.fanout)
     }
 }
 
 /// Gossip the given `message` to a random subset of size `fanout` of `targets`.
-fn gossip<E, D, M, I>(delivery: &D, message: &M, targets: &Vec<E>, fanout: usize)
+fn gossip<P, D, M, I, E>(
+    delivery: &D,
+    message: &M,
+    targets: &Vec<P>,
+    fanout: usize,
+) -> Result<(), E>
 where
     M: Message<I = I>,
-    D: Delivery<M, E>,
+    D: Delivery<M, P, E>,
     I: Eq + Hash,
 {
     let mut rng = rand::thread_rng();
     let chosen = targets.choose_multiple(&mut rng, fanout);
     for endpoint in chosen {
-        delivery.deliver(message, endpoint);
+        delivery.deliver(message, endpoint)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -214,13 +222,14 @@ mod tests {
     /// A "network" that just keeps track of which endpoints (keys) received which messages (values).
     struct Network(RefCell<HashMap<usize, Vec<usize>>>);
 
-    impl Delivery<usize, usize> for Network {
-        fn deliver(&self, message: &usize, endpoint: &usize) {
+    impl Delivery<usize, usize, ()> for Network {
+        fn deliver(&self, message: &usize, endpoint: &usize) -> Result<(), ()> {
             self.0
                 .borrow_mut()
                 .entry(*endpoint)
                 .or_default()
                 .push(*message);
+            Ok(())
         }
     }
 
@@ -237,7 +246,7 @@ mod tests {
     #[test]
     fn gossip_to_all() {
         let network = Network(RefCell::new(HashMap::new()));
-        gossip(&network, &10, &vec![1, 2, 3], 3);
+        gossip(&network, &10, &vec![1, 2, 3], 3).unwrap();
         assert_eq!(Some(&vec![10]), network.0.borrow().get(&1));
         assert_eq!(Some(&vec![10]), network.0.borrow().get(&2));
         assert_eq!(Some(&vec![10]), network.0.borrow().get(&3));
@@ -247,7 +256,7 @@ mod tests {
     #[test]
     fn gossip_to_some() {
         let network = Network(RefCell::new(HashMap::new()));
-        gossip(&network, &10, &vec![1, 2, 3, 4, 5], 3);
+        gossip(&network, &10, &vec![1, 2, 3, 4, 5], 3).unwrap();
         assert_eq!(3, network.0.borrow().len());
     }
 }
