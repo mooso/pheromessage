@@ -13,12 +13,21 @@ pub struct Channels();
 /// The singleton `Channels`.
 pub const CHANNELS: Channels = Channels();
 
-impl<M> Delivery<M, mpsc::Sender<M>, SendError<M>> for Channels
+impl<M> Delivery<M, mpsc::Sender<M>> for Channels
 where
     M: Clone,
 {
-    fn deliver(&self, message: &M, endpoint: &mpsc::Sender<M>) -> Result<(), SendError<M>> {
-        endpoint.send(message.clone())
+    type Error = SendError<M>;
+
+    fn deliver<'a, I>(&self, message: &M, endpoints: I) -> Result<(), SendError<M>>
+    where
+        I: ExactSizeIterator<Item = &'a mpsc::Sender<M>>,
+        M: 'a,
+    {
+        for endpoint in endpoints {
+            endpoint.send(message.clone())?;
+        }
+        Ok(())
     }
 }
 

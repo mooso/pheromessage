@@ -6,20 +6,28 @@ use std::{
 
 pub mod channel;
 pub mod data;
+pub mod net;
 
 /// Delivery mechanism for delivering messages (`M`) to endpoints (`P`).
-pub trait Delivery<M, P, E> {
-    /// Deliver the given message to the given endpoint.
-    fn deliver(&self, message: &M, endpoint: &P) -> Result<(), E>;
+pub trait Delivery<M, P> {
+    type Error;
+
+    /// Deliver the given message to the given endpoints.
+    fn deliver<'a, I>(&self, message: &M, endpoints: I) -> Result<(), Self::Error>
+    where
+        I: ExactSizeIterator<Item = &'a P>,
+        P: 'a;
 }
 
 /// A gossip mechanism for maintaining shared data and updating it by gossiping with peers.
-pub trait Gossip<M, E> {
+pub trait Gossip<M> {
+    type Error;
+
     /// Indicate that the given message has been received from a peer.
-    fn receive(&mut self, message: &M) -> Result<(), E>;
+    fn receive(&mut self, message: &M) -> Result<(), Self::Error>;
 
     /// Update the data by the given message and gossip it.
-    fn update(&mut self, message: &M) -> Result<(), E>;
+    fn update(&mut self, message: &M) -> Result<(), Self::Error>;
 }
 
 /// A message that can update shared data.
@@ -66,14 +74,16 @@ impl<P, S, D, I> UniformGossip<P, S, D, I> {
     }
 }
 
-impl<P, S, D, M, I, E> Gossip<M, E> for UniformGossip<P, S, D, I>
+impl<P, S, D, M, I> Gossip<M> for UniformGossip<P, S, D, I>
 where
     M: Message<I = I>,
-    D: Delivery<M, P, E>,
+    D: Delivery<M, P>,
     I: Eq + Hash,
     S: SharedData<M>,
 {
-    fn receive(&mut self, message: &M) -> Result<(), E> {
+    type Error = D::Error;
+
+    fn receive(&mut self, message: &M) -> Result<(), Self::Error> {
         // Mark the message as seen
         let id = message.id();
         let new = self.seen_messages.insert(id);
@@ -86,7 +96,7 @@ where
         Ok(())
     }
 
-    fn update(&mut self, message: &M) -> Result<(), E> {
+    fn update(&mut self, message: &M) -> Result<(), Self::Error> {
         // Update my data.
         self.data.update(message);
         // Mark it as seen.
@@ -147,14 +157,16 @@ impl<P, S, D, I> PreferentialGossip<P, S, D, I> {
     }
 }
 
-impl<P, S, D, M, I, E> Gossip<M, E> for PreferentialGossip<P, S, D, I>
+impl<P, S, D, M, I> Gossip<M> for PreferentialGossip<P, S, D, I>
 where
     M: Message<I = I>,
-    D: Delivery<M, P, E>,
+    D: Delivery<M, P>,
     I: Eq + Hash,
     S: SharedData<M>,
 {
-    fn receive(&mut self, message: &M) -> Result<(), E> {
+    type Error = D::Error;
+
+    fn receive(&mut self, message: &M) -> Result<(), Self::Error> {
         // Update the amount of times I've seen this message.
         let count_seen = self.increment_seen(message.id());
         if count_seen == SeenCount::Once {
@@ -186,7 +198,7 @@ where
         Ok(())
     }
 
-    fn update(&mut self, message: &M) -> Result<(), E> {
+    fn update(&mut self, message: &M) -> Result<(), Self::Error> {
         self.data.update(message);
         self.increment_seen(message.id());
         gossip(&self.delivery, message, &self.primaries, self.fanout)
@@ -194,23 +206,20 @@ where
 }
 
 /// Gossip the given `message` to a random subset of size `fanout` of `targets`.
-fn gossip<P, D, M, I, E>(
+fn gossip<P, D, M, I>(
     delivery: &D,
     message: &M,
     targets: &Vec<P>,
     fanout: usize,
-) -> Result<(), E>
+) -> Result<(), D::Error>
 where
     M: Message<I = I>,
-    D: Delivery<M, P, E>,
+    D: Delivery<M, P>,
     I: Eq + Hash,
 {
     let mut rng = rand::thread_rng();
     let chosen = targets.choose_multiple(&mut rng, fanout);
-    for endpoint in chosen {
-        delivery.deliver(message, endpoint)?;
-    }
-    Ok(())
+    delivery.deliver(message, chosen)
 }
 
 #[cfg(test)]
@@ -222,13 +231,20 @@ mod tests {
     /// A "network" that just keeps track of which endpoints (keys) received which messages (values).
     struct Network(RefCell<HashMap<usize, Vec<usize>>>);
 
-    impl Delivery<usize, usize, ()> for Network {
-        fn deliver(&self, message: &usize, endpoint: &usize) -> Result<(), ()> {
-            self.0
-                .borrow_mut()
-                .entry(*endpoint)
-                .or_default()
-                .push(*message);
+    impl Delivery<usize, usize> for Network {
+        type Error = ();
+
+        fn deliver<'a, I>(&self, message: &usize, endpoints: I) -> Result<(), ()>
+        where
+            I: ExactSizeIterator<Item = &'a usize>,
+        {
+            for endpoint in endpoints {
+                self.0
+                    .borrow_mut()
+                    .entry(*endpoint)
+                    .or_default()
+                    .push(*message);
+            }
             Ok(())
         }
     }
