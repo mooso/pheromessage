@@ -8,6 +8,11 @@ license = "MIT"
 
 [dependencies]
 rand = { version = "0.8" }
+postcard = { version = "1.0", optional = true, features = ["alloc"] }
+serde = { version = "1.0", optional = true }
+
+[features]
+postcard = ["dep:postcard", "dep:serde"]
 
 [dev-dependencies]
 rayon = { version = "1" }

@@ -7,6 +7,8 @@ use std::{
 pub mod channel;
 pub mod data;
 pub mod net;
+#[cfg(feature = "postcard")]
+pub mod postmessage;
 
 /// Delivery mechanism for delivering messages (`M`) to endpoints (`P`).
 pub trait Delivery<M, P> {
