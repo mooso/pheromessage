@@ -41,7 +41,9 @@ struct Args {
 /// The action that can be taken by each node upon receiving a message.
 #[derive(Debug, Clone)]
 enum Action {
-    /// Modify the set and gossip about it.
+    /// A gossip message about modifying a set (as sent from another node).
+    GossipModifySet(GossipSetAction<u128>),
+    /// A primary message about modifying a set (as sent from the main program).
     ModifySet(GossipSetAction<u128>),
     /// Terminate the node.
     Terminate,
@@ -79,7 +81,7 @@ impl pheromessage::Message for Message {
 
 impl SharedData<Message> for GossipSet<u128> {
     fn update(&mut self, message: &Message) {
-        if let Action::ModifySet(action) = message.action {
+        if let Action::GossipModifySet(action) = message.action {
             match action {
                 GossipSetAction::Add(v) => self.add_item(v),
                 GossipSetAction::Remove(v) => self.remove_item(v),
@@ -95,7 +97,16 @@ where
 {
     while let Ok(message) = receiver.recv() {
         match message.action {
-            Action::ModifySet(_) => gossip.receive(&message)?,
+            Action::GossipModifySet(_) => gossip.receive(&message)?,
+            Action::ModifySet(v) => {
+                // This is a bit confusing, but when the main program is asking me to modify
+                // the set, I should use the `update()` function on the gossip but use a GossipModifySet
+                // action so that's the one that's gossipped to the other nodes.
+                gossip.update(&Message {
+                    id: message.id,
+                    action: Action::GossipModifySet(v),
+                })?
+            }
             Action::Terminate => break,
             Action::Query { element, answer } => {
                 answer.send(gossip.data().is_present(&element)).unwrap()
