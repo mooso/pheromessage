@@ -1,6 +1,7 @@
 //! Driver for running a local network of gossip nodes as threads that talk to each other.
 
 use std::{
+    fmt::Debug,
     sync::mpsc::{self, RecvTimeoutError},
     thread::spawn,
     time::{Duration, Instant},
@@ -9,7 +10,7 @@ use std::{
 use clap::Parser;
 use log::{debug, info, LevelFilter};
 use pheromessage::{
-    channel::uniform_local_gossip_set,
+    channel::{preferential_local_gossip_set, uniform_local_gossip_set, LocalGossipNode},
     data::{GossipSet, GossipSetAction},
     Gossip, SharedData,
 };
@@ -104,20 +105,96 @@ where
     Ok(())
 }
 
-fn main() {
-    let args = Args::parse();
-    SimpleLogger::new()
-        .with_level(LevelFilter::Info)
-        .with_local_timestamps()
-        .env()
-        .init()
-        .unwrap();
-    if args.primaries > 0 {
-        todo!("Not implemented yet");
+#[derive(Debug, Clone, Copy, Default)]
+struct LatencyAggregate {
+    total_latency: Duration,
+    num_elements: usize,
+}
+
+impl LatencyAggregate {
+    pub fn add_point(&mut self, latency: Duration) {
+        self.num_elements += 1;
+        self.total_latency += latency;
     }
 
-    info!("Creating network");
-    let network = uniform_local_gossip_set(args.nodes, args.fanout);
+    pub fn mean_micros(&self) -> f64 {
+        self.total_latency.as_micros() as f64 / self.num_elements as f64
+    }
+}
+
+trait Aggregator {
+    fn record_latency(&mut self, source_index: usize, target_index: usize, latency: Duration);
+    fn log(&self);
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct UniformGossipAggregator {
+    aggregate: LatencyAggregate,
+}
+
+impl Aggregator for UniformGossipAggregator {
+    fn record_latency(&mut self, _source_index: usize, _target_index: usize, latency: Duration) {
+        self.aggregate.add_point(latency);
+    }
+
+    fn log(&self) {
+        info!(
+            "Inserted {} elements with an average latency of {:.2} us",
+            self.aggregate.num_elements,
+            self.aggregate.mean_micros()
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreferentialGossipAggregator {
+    primaries_aggregate: LatencyAggregate,
+    secondaries_aggregate: LatencyAggregate,
+    num_primaries: usize,
+}
+
+impl PreferentialGossipAggregator {
+    pub fn new(num_primaries: usize) -> PreferentialGossipAggregator {
+        PreferentialGossipAggregator {
+            primaries_aggregate: Default::default(),
+            secondaries_aggregate: Default::default(),
+            num_primaries,
+        }
+    }
+}
+
+impl Aggregator for PreferentialGossipAggregator {
+    fn record_latency(&mut self, _source_index: usize, target_index: usize, latency: Duration) {
+        if target_index < self.num_primaries {
+            self.primaries_aggregate.add_point(latency);
+        } else {
+            self.secondaries_aggregate.add_point(latency);
+        }
+    }
+
+    fn log(&self) {
+        info!(
+            "Inserted {} elements. Primaries average latency is {:.2} us. Secondaries average latency is {:.2} us.",
+            self.primaries_aggregate.num_elements + self.secondaries_aggregate.num_elements,
+            self.primaries_aggregate.mean_micros(),
+            self.secondaries_aggregate.mean_micros(),
+        );
+    }
+}
+
+fn create_aggregator(args: &Args) -> Box<dyn Aggregator> {
+    if args.primaries > 0 {
+        Box::new(PreferentialGossipAggregator::new(args.primaries))
+    } else {
+        Box::new(UniformGossipAggregator::default())
+    }
+}
+
+fn run_network<G>(network: Vec<LocalGossipNode<G, GossipSet<u128>, Message>>, args: Args)
+where
+    G: Gossip<Message, GossipSet<u128>> + Send + 'static,
+    G::Error: Send + Debug,
+{
     let mut threads = Vec::with_capacity(network.len());
     let mut senders = Vec::with_capacity(network.len());
     for node in network.into_iter() {
@@ -131,8 +208,7 @@ fn main() {
     let log_period = Duration::from_secs(1); // How long to wait between log messages
     let mut next_log_target = start + log_period;
     let end = start + Duration::from_secs(args.time);
-    let mut elements_inserted = 0;
-    let mut total_latency = Duration::ZERO;
+    let mut aggregator = create_aggregator(&args);
     while Instant::now() < end {
         // Generate a random element to insert, and choose a start and target node
         let element: u128 = thread_rng().gen();
@@ -168,14 +244,9 @@ fn main() {
                 // The target node has seen the element we inserted.
                 let now = Instant::now();
                 let latency = now - insertion_time;
-                total_latency += latency;
-                elements_inserted += 1;
+                aggregator.record_latency(start_node, target_node, latency);
                 if now >= next_log_target {
-                    info!(
-                        "Inserted {} elements with an average latency of {:.2} us",
-                        elements_inserted,
-                        (total_latency.as_micros() as f64) / (elements_inserted as f64)
-                    );
+                    aggregator.log();
                     next_log_target = now + log_period;
                 }
                 // Done with this element, move on.
@@ -199,4 +270,23 @@ fn main() {
             debug!("Error sending terminate signal: {:?}", e);
         }
     }
+}
+
+fn main() {
+    let args = Args::parse();
+    SimpleLogger::new()
+        .with_level(LevelFilter::Info)
+        .with_local_timestamps()
+        .env()
+        .init()
+        .unwrap();
+    info!("Creating network");
+    if args.primaries == 0 {
+        run_network(uniform_local_gossip_set(args.nodes, args.fanout), args);
+    } else {
+        run_network(
+            preferential_local_gossip_set(args.nodes, args.primaries, args.fanout),
+            args,
+        );
+    };
 }
