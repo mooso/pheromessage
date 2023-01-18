@@ -2,7 +2,7 @@
 
 use std::sync::mpsc::{self, SendError};
 
-use crate::{data::GossipSet, Delivery, UniformGossip};
+use crate::{data::GossipSet, Delivery, PreferentialGossip, UniformGossip};
 
 /// An implementation of `Delivery` that delivers to `mpsc` receivers as endpoints.
 pub struct Channels();
@@ -28,11 +28,14 @@ where
     }
 }
 
-/// A representation of a gossip "node" that is a local `mpsc` receiver
+/// A representation of a uniform gossip "node" that is a local `mpsc` receiver
 /// and the gossip for it.
 pub struct LocalUniformGossipNode<S, M, I> {
+    /// The gossip for that node.
     pub gossip: UniformGossip<mpsc::Sender<M>, S, Channels, I>,
+    /// The receiver for messages intended for this node.
     pub receiver: mpsc::Receiver<M>,
+    /// The sender of messages to this node.
     pub sender: mpsc::Sender<M>,
 }
 
@@ -73,6 +76,84 @@ pub fn uniform_local_gossip_set<T, M>(
             receiver,
             sender,
         })
+        .collect()
+}
+
+/// A representation of a preferential gossip "node" that is a local `mpsc` receiver
+/// and the gossip for it.
+pub struct LocalPreferentialGossipNode<S, M, I> {
+    /// The gossip for that node.
+    pub gossip: PreferentialGossip<mpsc::Sender<M>, S, Channels, I>,
+    /// The receiver for messages intended for this node.
+    pub receiver: mpsc::Receiver<M>,
+    /// The sender of messages to this node.
+    pub sender: mpsc::Sender<M>,
+}
+
+/// A representation of a local preferential gossip "node" over a gossip set.
+pub type LocalPreferentialGossipSetNode<T, M> = LocalPreferentialGossipNode<GossipSet<T>, M, u128>;
+
+/// Creates a set of local gossip "nodes" that maintain a gossip set.
+/// Each node can be independently maintained in its own thread and will gossip
+/// with the other threads.
+/// The first `num_primaries` nodes returned will be the primary nodes that preferentially
+/// get first word of any update, with the rest being secondaries.
+pub fn preferential_local_gossip_set<T, M>(
+    num_nodes: usize,
+    num_primaries: usize,
+    fanout: usize,
+) -> Vec<LocalPreferentialGossipSetNode<T, M>> {
+    // Create the senders and receivers for the nodes.
+    let channels: Vec<_> = (0..num_nodes).map(|_| mpsc::channel()).collect();
+    // First create a Vec<> with all the gossips
+    let mut gossips = Vec::with_capacity(num_nodes);
+    let num_secondaries = num_nodes - num_primaries;
+    for i in 0..num_nodes {
+        // Create an empty set
+        let data = GossipSet::default();
+        // Create the set of senders (peers) for the node
+        let primary = i < num_primaries;
+        let mut primaries = Vec::with_capacity(if primary {
+            num_primaries - 1
+        } else {
+            num_primaries
+        });
+        let mut secondaries = Vec::with_capacity(if primary {
+            num_secondaries
+        } else {
+            num_secondaries - 1
+        });
+        for (j, other) in channels.iter().enumerate() {
+            // Add every sender except the one for the node
+            if i != j {
+                if j < num_primaries {
+                    primaries.push(other.0.clone());
+                } else {
+                    secondaries.push(other.0.clone());
+                }
+            }
+        }
+        // Add the node
+        gossips.push(PreferentialGossip::create(
+            primaries,
+            secondaries,
+            primary,
+            fanout,
+            data,
+            CHANNELS,
+        ));
+    }
+    // Then add the senders and receivers to create the network
+    gossips
+        .into_iter()
+        .zip(channels.into_iter())
+        .map(
+            |(gossip, (sender, receiver))| LocalPreferentialGossipSetNode {
+                gossip,
+                receiver,
+                sender,
+            },
+        )
         .collect()
 }
 

@@ -154,6 +154,30 @@ pub struct PreferentialGossip<P, S, D, I> {
 }
 
 impl<P, S, D, I> PreferentialGossip<P, S, D, I> {
+    /// Create a new preferential gossip mechanism that will gossip to the given set of `primaries`
+    /// and `secondaries`, with this node itself acting as primary if `primary` is `true`,
+    /// using the given `delivery` mechanism and maintaining the given `data`.
+    /// The gossip will be done using the given `fanout` - each message will be delivered
+    /// to a random subset of peers of that size.
+    pub fn create(
+        primaries: Vec<P>,
+        secondaries: Vec<P>,
+        primary: bool,
+        fanout: usize,
+        data: S,
+        delivery: D,
+    ) -> PreferentialGossip<P, S, D, I> {
+        PreferentialGossip {
+            primaries,
+            secondaries,
+            message_log: HashMap::new(),
+            primary,
+            delivery,
+            data,
+            fanout,
+        }
+    }
+
     fn increment_seen(&mut self, message_id: I) -> SeenCount
     where
         I: Eq + Hash,
