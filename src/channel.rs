@@ -63,14 +63,16 @@ pub type LocalPreferentialGossipSetNode<T, M, I> = LocalGossipNode<
 /// Creates a set of local gossip "nodes" that maintain a gossip set.
 /// Each node can be independently maintained in its own thread and will gossip
 /// with the other threads.
-pub fn uniform_local_gossip_set<T, M, I>(
+/// `T` is the type of element in the set, and `M` is the type of messages exchanged
+/// in the gossip.
+pub fn uniform_local_gossip_set<T, M>(
     num_nodes: usize,
     fanout: usize,
-) -> Vec<LocalUniformGossipSetNode<T, M, I>>
+) -> Vec<LocalUniformGossipSetNode<T, M, M::I>>
 where
-    M: Clone + Message<I = I>,
+    M: Clone + Message,
     GossipSet<T>: SharedData<M>,
-    I: Hash + Eq,
+    <M as Message>::I: Hash + Eq,
 {
     // Create the senders and receivers for the nodes.
     let channels: Vec<_> = (0..num_nodes).map(|_| mpsc::channel()).collect();
@@ -108,15 +110,17 @@ where
 /// with the other threads.
 /// The first `num_primaries` nodes returned will be the primary nodes that preferentially
 /// get first word of any update, with the rest being secondaries.
-pub fn preferential_local_gossip_set<T, M, I>(
+/// `T` is the type of element in the set, and `M` is the type of messages exchanged
+/// in the gossip.
+pub fn preferential_local_gossip_set<T, M>(
     num_nodes: usize,
     num_primaries: usize,
     fanout: usize,
-) -> Vec<LocalPreferentialGossipSetNode<T, M, I>>
+) -> Vec<LocalPreferentialGossipSetNode<T, M, M::I>>
 where
-    M: Clone + Message<I = I>,
+    M: Clone + Message,
     GossipSet<T>: SharedData<M>,
-    I: Hash + Eq,
+    <M as Message>::I: Hash + Eq,
 {
     // Create the senders and receivers for the nodes.
     let channels: Vec<_> = (0..num_nodes).map(|_| mpsc::channel()).collect();
