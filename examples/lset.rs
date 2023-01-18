@@ -7,7 +7,7 @@ use std::{
 };
 
 use clap::Parser;
-use log::{info, LevelFilter};
+use log::{debug, info, LevelFilter};
 use pheromessage::{
     channel::uniform_local_gossip_set,
     data::{GossipSet, GossipSetAction},
@@ -186,9 +186,17 @@ fn main() {
 
     info!("Terminating");
     for sender in senders {
-        sender.send(Message::new(Action::Terminate)).unwrap();
+        if let Err(e) = sender.send(Message::new(Action::Terminate)) {
+            // There's a race in the end when one node terminates and the other nodes try to gossip to it
+            // then those nodes end up failing to send to that node and exit, so I can't send to them...
+            // For that I just ignore errors at the end.
+            debug!("Error sending terminate signal: {:?}", e);
+        }
     }
     for thread in threads {
-        thread.join().unwrap().unwrap();
+        if let Err(e) = thread.join().unwrap() {
+            // See above why I'm not worried about errors from the threads.
+            debug!("Error sending terminate signal: {:?}", e);
+        }
     }
 }
