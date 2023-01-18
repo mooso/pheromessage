@@ -22,7 +22,7 @@ pub trait Delivery<M, P> {
 }
 
 /// A gossip mechanism for maintaining shared data and updating it by gossiping with peers.
-pub trait Gossip<M> {
+pub trait Gossip<M, S> {
     type Error;
 
     /// Indicate that the given message has been received from a peer.
@@ -30,6 +30,9 @@ pub trait Gossip<M> {
 
     /// Update the data by the given message and gossip it.
     fn update(&mut self, message: &M) -> Result<(), Self::Error>;
+
+    /// The underlying data being gossipped about.
+    fn data(&self) -> &S;
 }
 
 /// A message that can update shared data.
@@ -76,7 +79,7 @@ impl<P, S, D, I> UniformGossip<P, S, D, I> {
     }
 }
 
-impl<P, S, D, M, I> Gossip<M> for UniformGossip<P, S, D, I>
+impl<P, S, D, M, I> Gossip<M, S> for UniformGossip<P, S, D, I>
 where
     M: Message<I = I>,
     D: Delivery<M, P>,
@@ -105,6 +108,10 @@ where
         self.seen_messages.insert(message.id());
         // Pass it on to my peers.
         gossip(&self.delivery, message, &self.peers, self.fanout)
+    }
+
+    fn data(&self) -> &S {
+        &self.data
     }
 }
 
@@ -159,7 +166,7 @@ impl<P, S, D, I> PreferentialGossip<P, S, D, I> {
     }
 }
 
-impl<P, S, D, M, I> Gossip<M> for PreferentialGossip<P, S, D, I>
+impl<P, S, D, M, I> Gossip<M, S> for PreferentialGossip<P, S, D, I>
 where
     M: Message<I = I>,
     D: Delivery<M, P>,
@@ -204,6 +211,10 @@ where
         self.data.update(message);
         self.increment_seen(message.id());
         gossip(&self.delivery, message, &self.primaries, self.fanout)
+    }
+
+    fn data(&self) -> &S {
+        &self.data
     }
 }
 

@@ -2,10 +2,7 @@
 
 use std::sync::mpsc::{self, SendError};
 
-use crate::{
-    data::{GossipSet, GossipSetMessage},
-    Delivery, UniformGossip,
-};
+use crate::{data::GossipSet, Delivery, UniformGossip};
 
 /// An implementation of `Delivery` that delivers to `mpsc` receivers as endpoints.
 pub struct Channels();
@@ -36,52 +33,47 @@ where
 pub struct LocalUniformGossipNode<S, M, I> {
     pub gossip: UniformGossip<mpsc::Sender<M>, S, Channels, I>,
     pub receiver: mpsc::Receiver<M>,
+    pub sender: mpsc::Sender<M>,
 }
 
 /// A representation of a local gossip "node" over a gossip set.
-pub type LocalUniformGossipSetNode<T> =
-    LocalUniformGossipNode<GossipSet<T>, GossipSetMessage<T>, u128>;
+pub type LocalUniformGossipSetNode<T, M> = LocalUniformGossipNode<GossipSet<T>, M, u128>;
 
 /// Creates a set of local gossip "nodes" that maintain a gossip set.
 /// Each node can be independently maintained in its own thread and will gossip
 /// with the other threads.
-pub fn uniform_local_gossip_set<T>(
+pub fn uniform_local_gossip_set<T, M>(
     num_nodes: usize,
     fanout: usize,
-) -> Vec<LocalUniformGossipSetNode<T>> {
-    // Create the vecs for the nodes, the senders and receivers.
-    let mut network = Vec::with_capacity(num_nodes);
-    let mut senders = Vec::with_capacity(num_nodes);
-    let mut receivers = Vec::with_capacity(num_nodes);
+) -> Vec<LocalUniformGossipSetNode<T, M>> {
     // Create the senders and receivers for the nodes.
-    for _ in 0..num_nodes {
-        let (tx, rx) = mpsc::channel();
-        senders.push(tx);
-        receivers.push(rx);
-    }
-    // Go over the receivers and add a node with that receiver
-    // plus every other sender. Since I'm popping from the receiver
-    // Vec the corresponding index is in reverse.
-    for i in (0..num_nodes).rev() {
-        // Get the receiver
-        let receiver = receivers.pop().unwrap();
+    let channels: Vec<_> = (0..num_nodes).map(|_| mpsc::channel()).collect();
+    // First create a Vec<> with all the gossips
+    let mut gossips = Vec::with_capacity(num_nodes);
+    for i in 0..num_nodes {
         // Create an empty set
         let data = GossipSet::default();
         // Create the set of senders (peers) for the node
         let mut peers = Vec::with_capacity(num_nodes - 1);
-        for (j, sender) in senders.iter().enumerate() {
+        for (j, other) in channels.iter().enumerate() {
             // Add every sender except the one for the node
             if i != j {
-                peers.push(sender.clone());
+                peers.push(other.0.clone());
             }
         }
         // Add the node
-        network.push(LocalUniformGossipSetNode {
-            gossip: UniformGossip::create(peers, fanout, data, CHANNELS),
-            receiver,
-        })
+        gossips.push(UniformGossip::create(peers, fanout, data, CHANNELS));
     }
-    network
+    // Then add the senders and receivers to create the network
+    gossips
+        .into_iter()
+        .zip(channels.into_iter())
+        .map(|(gossip, (sender, receiver))| LocalUniformGossipSetNode {
+            gossip,
+            receiver,
+            sender,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -95,7 +87,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use crate::Gossip;
+    use crate::{data::GossipSetMessage, Gossip};
 
     use super::*;
     use rand::prelude::*;
