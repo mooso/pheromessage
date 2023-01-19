@@ -36,6 +36,10 @@ struct Args {
     /// If specified as more than 0 (default), then we'll use a preferential gossip algorithm and designate the number of primary nodes.
     #[arg(short, long, default_value_t = 0)]
     primaries: usize,
+
+    /// If more than 0, then we'll declare a message lost if we don't see it in our target node after this many milliseconds.
+    #[arg(short, long, default_value_t = 500)]
+    lost_time_millis: u64,
 }
 
 /// The action that can be taken by each node upon receiving a message.
@@ -56,6 +60,7 @@ enum Action {
     },
 }
 
+/// The messsage that each node can process.
 #[derive(Debug, Clone)]
 struct Message {
     id: u128,
@@ -116,6 +121,7 @@ where
     Ok(())
 }
 
+/// An aggregate of latency.
 #[derive(Debug, Clone, Copy, Default)]
 struct LatencyAggregate {
     total_latency: Duration,
@@ -133,14 +139,33 @@ impl LatencyAggregate {
     }
 }
 
+/// Definition of aggregator for the fates of elements inserted into one node(source) than waiting for
+/// them to appear in another (target).
 trait Aggregator {
+    /// Record that from the time of inserting an element into a node (source) until it appeared in
+    /// another (target), the duration was the given latency.
     fn record_latency(&mut self, source_index: usize, target_index: usize, latency: Duration);
+    /// Record that after inserting an element into a node (source), we waited for it to appear in
+    /// another (target) then gave up after a timeout.
+    fn record_loss(&mut self, source_index: usize, target_index: usize);
+    /// Log the current aggregate latencies.
     fn log(&self);
 }
 
+/// An aggregator for use with uniform gossip.
 #[derive(Debug, Clone, Copy, Default)]
 struct UniformGossipAggregator {
     aggregate: LatencyAggregate,
+    lost_elements: usize,
+}
+
+/// Helper function to calculate the percentage of lost elements.
+fn lost_percent(lost_elements: usize, total_elements: usize) -> f64 {
+    if total_elements == 0 {
+        0.0
+    } else {
+        (lost_elements as f64 / total_elements as f64) * 100.0
+    }
 }
 
 impl Aggregator for UniformGossipAggregator {
@@ -148,20 +173,29 @@ impl Aggregator for UniformGossipAggregator {
         self.aggregate.add_point(latency);
     }
 
+    fn record_loss(&mut self, _source_index: usize, _target_index: usize) {
+        self.lost_elements += 1;
+    }
+
     fn log(&self) {
         info!(
-            "Inserted {} elements with an average latency of {:.2} us",
+            "Inserted {} elements with an average latency of {:.2} us. {} elements lost ({:.2}%).",
             self.aggregate.num_elements,
-            self.aggregate.mean_micros()
+            self.aggregate.mean_micros(),
+            self.lost_elements,
+            lost_percent(self.lost_elements, self.aggregate.num_elements)
         );
     }
 }
 
+/// An aggregator for use with preferential gossip.
 #[derive(Debug, Clone, Copy)]
 struct PreferentialGossipAggregator {
     primaries_aggregate: LatencyAggregate,
     secondaries_aggregate: LatencyAggregate,
     num_primaries: usize,
+    lost_in_primaries: usize,
+    lost_in_secondaries: usize,
 }
 
 impl PreferentialGossipAggregator {
@@ -170,6 +204,8 @@ impl PreferentialGossipAggregator {
             primaries_aggregate: Default::default(),
             secondaries_aggregate: Default::default(),
             num_primaries,
+            lost_in_primaries: 0,
+            lost_in_secondaries: 0,
         }
     }
 }
@@ -183,12 +219,24 @@ impl Aggregator for PreferentialGossipAggregator {
         }
     }
 
+    fn record_loss(&mut self, _source_index: usize, target_index: usize) {
+        if target_index < self.num_primaries {
+            self.lost_in_primaries += 1;
+        } else {
+            self.lost_in_secondaries += 1;
+        }
+    }
+
     fn log(&self) {
         info!(
-            "Inserted {} elements. Primaries average latency is {:.2} us. Secondaries average latency is {:.2} us.",
+            "Inserted {} elements. Primaries average latency is {:.2} us. Secondaries average latency is {:.2} us. Elements lost in: primaries {} ({:.2}%), secondaries {} ({:.2}%)",
             self.primaries_aggregate.num_elements + self.secondaries_aggregate.num_elements,
             self.primaries_aggregate.mean_micros(),
             self.secondaries_aggregate.mean_micros(),
+            self.lost_in_primaries,
+            lost_percent(self.lost_in_primaries, self.primaries_aggregate.num_elements),
+            self.lost_in_secondaries,
+            lost_percent(self.lost_in_secondaries, self.secondaries_aggregate.num_elements),
         );
     }
 }
@@ -198,6 +246,67 @@ fn create_aggregator(args: &Args) -> Box<dyn Aggregator> {
         Box::new(PreferentialGossipAggregator::new(args.primaries))
     } else {
         Box::new(UniformGossipAggregator::default())
+    }
+}
+
+/// The outcome for waiting for an element to appear in a target node.
+#[derive(Debug, Clone, Copy)]
+enum WaitForElementOutcome {
+    /// The element appeared in the target node after the recorded duration.
+    Appeared(Duration),
+    /// The element never appeared in the target node and we gave up.
+    Lost,
+    /// The end time of the program was reached before we got the element.
+    EndTimeReached,
+}
+
+/// Wait for an element to appear in a target node. We'll use `my_tx` and `my_rx` to communicate with the node.
+/// If `end_time` is reached before the element appears, we'll return with `EndTimeReached`.
+/// If `loss_timeout` passes before the element appears, we'll return with `Lost`.
+fn wait_for_element(
+    target_node: &mpsc::Sender<Message>,
+    element: u128,
+    end_time: Instant,
+    loss_timeout: Option<Duration>,
+    my_tx: &mpsc::Sender<bool>,
+    my_rx: &mpsc::Receiver<bool>,
+) -> WaitForElementOutcome {
+    let insertion_time = Instant::now();
+    let loss_time = loss_timeout.map(|timeout| insertion_time + timeout);
+    // Keep checking for the element in the target node until it appears
+    loop {
+        target_node
+            .send(Message::new(Action::Query {
+                element,
+                answer: my_tx.clone(),
+            }))
+            .unwrap();
+        // Don't wait for the answer beyond our end time
+        let now = Instant::now();
+        if now >= end_time {
+            return WaitForElementOutcome::EndTimeReached;
+        }
+        let mut timeout = end_time - now;
+        let mut timeout_result = WaitForElementOutcome::EndTimeReached;
+        if let Some(loss_timeout) = loss_timeout {
+            if loss_timeout < timeout {
+                timeout = loss_timeout;
+                timeout_result = WaitForElementOutcome::Lost;
+            }
+        }
+        let answer = match my_rx.recv_timeout(timeout) {
+            Ok(answer) => answer,
+            Err(RecvTimeoutError::Timeout) => return timeout_result,
+            Err(e) => Err(e).unwrap(),
+        };
+        if answer {
+            // The target node has seen the element we inserted.
+            return WaitForElementOutcome::Appeared(Instant::now() - insertion_time);
+        } else if let Some(loss_time) = loss_time {
+            if Instant::now() >= loss_time {
+                return WaitForElementOutcome::Lost;
+            }
+        }
     }
 }
 
@@ -214,6 +323,11 @@ where
     }
 
     info!("Running");
+    let loss_timeout = if args.lost_time_millis == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(args.lost_time_millis))
+    };
     let start = Instant::now();
     let (tx, rx) = mpsc::channel(); // For querying nodes.
     let log_period = Duration::from_secs(1); // How long to wait between log messages
@@ -231,38 +345,19 @@ where
                 element,
             ))))
             .unwrap();
-        let insertion_time = Instant::now();
-        // Keep checking for the element in the target node until it appears
-        loop {
-            senders[target_node]
-                .send(Message::new(Action::Query {
-                    element,
-                    answer: tx.clone(),
-                }))
-                .unwrap();
-            // Don't wait for the answer beyond our end time
-            let now = Instant::now();
-            if now >= end {
-                break;
+        // Wait for the element to appear in the target
+        let outcome = wait_for_element(&senders[target_node], element, end, loss_timeout, &tx, &rx);
+        match outcome {
+            WaitForElementOutcome::Appeared(latency) => {
+                aggregator.record_latency(start_node, target_node, latency)
             }
-            let timeout = end - now;
-            let answer = match rx.recv_timeout(timeout) {
-                Ok(answer) => answer,
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(e) => Err(e).unwrap(),
-            };
-            if answer {
-                // The target node has seen the element we inserted.
-                let now = Instant::now();
-                let latency = now - insertion_time;
-                aggregator.record_latency(start_node, target_node, latency);
-                if now >= next_log_target {
-                    aggregator.log();
-                    next_log_target = now + log_period;
-                }
-                // Done with this element, move on.
-                break;
-            }
+            WaitForElementOutcome::Lost => aggregator.record_loss(start_node, target_node),
+            WaitForElementOutcome::EndTimeReached => break,
+        }
+        let now = Instant::now();
+        if now >= next_log_target {
+            aggregator.log();
+            next_log_target = now + log_period;
         }
     }
 
