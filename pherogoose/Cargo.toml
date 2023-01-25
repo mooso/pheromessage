@@ -1,0 +1,15 @@
+[package]
+name = "pherogoose"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mostafa Elhemali"]
+description = "A wasm library that uses pheromessage to simulate simple gossip networks in a web page"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pheromessage = { path = '../pheromessage' }
+wasm-bindgen = { version = "0.2" }
+getrandom = { version = "0.2", features = ["js"] }
