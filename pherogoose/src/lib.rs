@@ -137,13 +137,17 @@ where
     <G as Gossip<GossipSetMessage<PrimaryColor>, GossipSet<PrimaryColor>>>::Error: std::fmt::Debug,
 {
     /// Tick forward in the simulation - process one message per watcher.
-    pub fn tick(&mut self) {
+    /// Returns false if the network is now idle (no messages remaining).
+    pub fn tick(&mut self) -> bool {
+        let mut some_messages_remaining = false;
         for (watcher, color) in self.watchers.iter_mut().zip(self.watcher_colors.iter_mut()) {
             if let Some(message) = watcher.message_queue.borrow_mut().pop_front() {
                 watcher.gossip.receive(&message).unwrap();
                 *color = color_for_set(watcher.gossip.data());
+                some_messages_remaining = true;
             }
         }
+        some_messages_remaining
     }
 
     /// Add a color to the gossip starting at the given watcher index (`inspired_watcher`).
@@ -189,8 +193,9 @@ impl UniformCult {
     }
 
     /// Tick forward in the simulation - process one message per watcher.
-    pub fn tick(&mut self) {
-        self.cult.tick();
+    /// Returns false if the network is now idle (no messages remaining).
+    pub fn tick(&mut self) -> bool {
+        self.cult.tick()
     }
 
     /// Add a color to the gossip starting at the given watcher index (`inspired_watcher`).
