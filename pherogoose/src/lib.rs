@@ -9,6 +9,7 @@ use pheromessage::{
     data::{GossipSet, GossipSetMessage},
     Delivery, Gossip, Message, PreferentialGossip, UniformGossip,
 };
+use rand::prelude::*;
 use wasm_bindgen::prelude::*;
 
 /// An implementation of `Delivery` that delivers to `RefCell<VecDeque>` receivers as endpoints.
@@ -206,7 +207,12 @@ where
     /// Returns false if the network is now idle (no messages remaining).
     pub fn tick(&mut self) -> bool {
         let mut some_messages_remaining = false;
-        for (watcher, color) in self.watchers.iter_mut().zip(self.watcher_colors.iter_mut()) {
+        // Go over the watchers in random order every time so as not to bias.
+        let mut order: Vec<_> = (0..self.watchers.len()).collect();
+        order.shuffle(&mut thread_rng());
+        for i in order {
+            let watcher = self.watchers.get_mut(i).unwrap();
+            let color = self.watcher_colors.get_mut(i).unwrap();
             if let Some(message) = watcher.message_queue.borrow_mut().pop_front() {
                 watcher.gossip.receive(&message).unwrap();
                 *color = color_for_set(watcher.gossip.data());

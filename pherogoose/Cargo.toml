@@ -13,3 +13,4 @@ crate-type = ["cdylib", "rlib"]
 pheromessage = { path = '../pheromessage' }
 wasm-bindgen = { version = "0.2" }
 getrandom = { version = "0.2", features = ["js"] }
+rand = { version = "0.8" }
