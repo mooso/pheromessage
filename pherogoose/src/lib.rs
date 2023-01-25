@@ -7,7 +7,7 @@ use std::{cell::RefCell, collections::VecDeque, iter, rc::Rc};
 
 use pheromessage::{
     data::{GossipSet, GossipSetMessage},
-    Delivery, Gossip, Message, UniformGossip,
+    Delivery, Gossip, Message, PreferentialGossip, UniformGossip,
 };
 use wasm_bindgen::prelude::*;
 
@@ -78,6 +78,9 @@ type MesageId = <GossipSetMessage<PrimaryColor> as Message>::I;
 /// The type of uniform gossip for this network.
 type UniformGooseGossip =
     UniformGossip<GooseWatcherPeer, GossipSet<PrimaryColor>, Queues, MesageId>;
+/// The type of preferential gossip for this network.
+type PreferentialGooseGossip =
+    PreferentialGossip<GooseWatcherPeer, GossipSet<PrimaryColor>, Queues, MesageId>;
 
 /// Create a new uniform cult with the given number of watchers and the fanout to use
 /// for gossipping.
@@ -100,6 +103,69 @@ fn new_uniform(num_watchers: usize, fanout: usize) -> GooseCult<UniformGooseGoss
         }
         // Add the node
         gossips.push(UniformGossip::create(peers, fanout, data, QUEUES));
+    }
+    // Then add the message queues to create the network
+    let watchers = gossips
+        .into_iter()
+        .zip(message_queues.into_iter())
+        .map(|(gossip, message_queue)| GooseWatcher {
+            gossip,
+            message_queue,
+        })
+        .collect();
+    GooseCult {
+        watcher_colors,
+        watchers,
+    }
+}
+
+/// Create a new preferential cult with the given number of watchers and the fanout to use
+/// for gossipping, and the number of privileged high priests among the watchers.
+fn new_preferential(
+    num_watchers: usize,
+    num_high_priests: usize,
+    fanout: usize,
+) -> GooseCult<PreferentialGooseGossip> {
+    let watcher_colors = iter::repeat(0_u32).take(num_watchers).collect();
+    let message_queues: Vec<GooseWatcherPeer> =
+        iter::repeat_with(Rc::default).take(num_watchers).collect();
+    // First create a Vec<> with all the gossips
+    let mut gossips = Vec::with_capacity(num_watchers);
+    let num_secondaries = num_watchers - num_high_priests;
+    for i in 0..num_watchers {
+        // Create an empty set
+        let data = GossipSet::default();
+        // Create the set of senders (peers) for the node
+        let primary = i < num_high_priests;
+        let mut primaries = Vec::with_capacity(if primary {
+            num_high_priests - 1
+        } else {
+            num_high_priests
+        });
+        let mut secondaries = Vec::with_capacity(if primary {
+            num_secondaries
+        } else {
+            num_secondaries - 1
+        });
+        for (j, other) in message_queues.iter().enumerate() {
+            // Add every sender except the one for the node
+            if i != j {
+                if j < num_high_priests {
+                    primaries.push(other.clone());
+                } else {
+                    secondaries.push(other.clone());
+                }
+            }
+        }
+        // Add the node
+        gossips.push(PreferentialGossip::create(
+            primaries,
+            secondaries,
+            primary,
+            fanout,
+            data,
+            QUEUES,
+        ));
     }
     // Then add the message queues to create the network
     let watchers = gossips
@@ -184,6 +250,46 @@ impl UniformCult {
     pub fn new(num_watchers: usize, fanout: usize) -> UniformCult {
         UniformCult {
             cult: new_uniform(num_watchers, fanout),
+        }
+    }
+
+    /// The current knowledge of the color of the goose as an array of size `num_watchers`.
+    pub fn colors(&self) -> *const u32 {
+        self.cult.watcher_colors.as_ptr()
+    }
+
+    /// Tick forward in the simulation - process one message per watcher.
+    /// Returns false if the network is now idle (no messages remaining).
+    pub fn tick(&mut self) -> bool {
+        self.cult.tick()
+    }
+
+    /// Add a color to the gossip starting at the given watcher index (`inspired_watcher`).
+    pub fn add_color(&mut self, inspired_watcher: usize, color: PrimaryColor) {
+        self.cult.add_color(inspired_watcher, color);
+    }
+
+    /// Remove a color from the gossip starting at the given watcher index (`inspired_watcher`).
+    pub fn remove_color(&mut self, inspired_watcher: usize, color: PrimaryColor) {
+        self.cult.remove_color(inspired_watcher, color);
+    }
+}
+
+/// A striated cult of goose watchers, where all some watchers are higher ranked and get word sooner.
+#[wasm_bindgen]
+pub struct StriatedCult {
+    cult: GooseCult<PreferentialGooseGossip>,
+}
+
+#[wasm_bindgen]
+impl StriatedCult {
+    /// Create a new striated cult of the given number of watchers and `fanout` to use
+    /// while gossipping (the number of watchers to talk to when spreading gossip).
+    /// A subset of watchers - the first  `num_high_priests` - are priviliged to get first
+    /// word of any new gossip.
+    pub fn new(num_watchers: usize, num_high_priests: usize, fanout: usize) -> StriatedCult {
+        StriatedCult {
+            cult: new_preferential(num_watchers, num_high_priests, fanout),
         }
     }
 
