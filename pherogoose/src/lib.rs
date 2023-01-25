@@ -3,7 +3,7 @@
 //! watchers trying to guess the true color of the magic goose by adding/removing
 //! a `PrimaryColor` to the shared `GossipSet`.
 
-use std::{cell::RefCell, collections::VecDeque, iter};
+use std::{cell::RefCell, collections::VecDeque, iter, rc::Rc};
 
 use pheromessage::{
     data::{GossipSet, GossipSetMessage},
@@ -18,7 +18,7 @@ struct Queues();
 /// The singleton `Queues`.
 const QUEUES: Queues = Queues();
 
-impl<M> Delivery<M, RefCell<VecDeque<M>>> for Queues
+impl<M> Delivery<M, Rc<RefCell<VecDeque<M>>>> for Queues
 where
     M: Clone,
 {
@@ -26,7 +26,7 @@ where
 
     fn deliver<'a, I>(&self, message: &M, endpoints: I) -> Result<(), ()>
     where
-        I: ExactSizeIterator<Item = &'a RefCell<VecDeque<M>>>,
+        I: ExactSizeIterator<Item = &'a Rc<RefCell<VecDeque<M>>>>,
         M: 'a,
     {
         for endpoint in endpoints {
@@ -53,7 +53,7 @@ where
     G: Gossip<GossipSetMessage<PrimaryColor>, GossipSet<PrimaryColor>>,
 {
     /// The message queue for messages intended for this watcher.
-    message_queue: RefCell<VecDeque<GossipSetMessage<PrimaryColor>>>,
+    message_queue: GooseWatcherPeer,
     /// The gossip node for this watcher.
     gossip: G,
 }
@@ -72,7 +72,7 @@ where
 }
 
 /// The type of peer in the network (a reference to their message queue).
-type GooseWatcherPeer = RefCell<VecDeque<GossipSetMessage<PrimaryColor>>>;
+type GooseWatcherPeer = Rc<RefCell<VecDeque<GossipSetMessage<PrimaryColor>>>>;
 // The type of message ID
 type MesageId = <GossipSetMessage<PrimaryColor> as Message>::I;
 /// The type of uniform gossip for this network.
@@ -83,9 +83,8 @@ type UniformGooseGossip =
 /// for gossipping.
 fn new_uniform(num_watchers: usize, fanout: usize) -> GooseCult<UniformGooseGossip> {
     let watcher_colors = iter::repeat(0_u32).take(num_watchers).collect();
-    let message_queues: Vec<_> = iter::repeat_with(RefCell::default)
-        .take(num_watchers)
-        .collect();
+    let message_queues: Vec<GooseWatcherPeer> =
+        iter::repeat_with(Rc::default).take(num_watchers).collect();
     // First create a Vec<> with all the gossips
     let mut gossips = Vec::with_capacity(num_watchers);
     for i in 0..num_watchers {
@@ -153,6 +152,8 @@ where
             .gossip
             .update(&GossipSetMessage::add(color))
             .unwrap();
+        self.watcher_colors[inspired_watcher] =
+            color_for_set(self.watchers[inspired_watcher].gossip.data());
     }
 
     /// Remove a color from the gossip starting at the given watcher index (`inspired_watcher`).
@@ -161,6 +162,8 @@ where
             .gossip
             .update(&GossipSetMessage::remove(color))
             .unwrap();
+        self.watcher_colors[inspired_watcher] =
+            color_for_set(self.watchers[inspired_watcher].gossip.data());
     }
 }
 
@@ -198,5 +201,32 @@ impl UniformCult {
     /// Remove a color from the gossip starting at the given watcher index (`inspired_watcher`).
     pub fn remove_color(&mut self, inspired_watcher: usize, color: PrimaryColor) {
         self.cult.remove_color(inspired_watcher, color);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_blue() {
+        let mut cult = UniformCult::new(100, 10);
+        cult.add_color(50, PrimaryColor::Blue);
+        assert_eq!(255, cult.cult.watcher_colors[50]);
+        cult.tick();
+        let num_blue = cult
+            .cult
+            .watcher_colors
+            .iter()
+            .filter(|c| **c == 255)
+            .count();
+        assert!(num_blue > 10);
+    }
+
+    #[test]
+    fn add_red() {
+        let mut cult = UniformCult::new(100, 10);
+        cult.add_color(50, PrimaryColor::Red);
+        assert_eq!(255 << 16, cult.cult.watcher_colors[50]);
     }
 }
