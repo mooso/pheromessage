@@ -11,8 +11,11 @@ use clap::Parser;
 use hdrhistogram::Histogram;
 use log::{debug, info, LevelFilter};
 use pheromessage::{
-    channel::{preferential_local_gossip_set, uniform_local_gossip_set, LocalGossipNode},
     data::{GossipSet, GossipSetAction},
+    multiplex::{
+        preferential_local_gossip_set, uniform_local_gossip_set, Envelope, LocalGossipNodeGroup,
+        NodeGroupInfo,
+    },
     Gossip, SharedData,
 };
 use rand::prelude::*;
@@ -29,6 +32,10 @@ struct Args {
     /// Fanout of how many nodes to gossip to when a message is received.
     #[arg(short, long, default_value_t = 4)]
     fanout: usize,
+
+    /// Number of peers that each node knows about
+    #[arg(short = 'e', long, default_value_t = 15)]
+    peers_per_node: usize,
 
     /// The time in seconds to run the network for.
     #[arg(short, long, default_value_t = 10)]
@@ -97,11 +104,15 @@ impl SharedData<Message> for GossipSet<u128> {
 }
 
 /// Thread function for running a gossip node.
-fn run_node<G>(mut gossip: G, receiver: mpsc::Receiver<Message>) -> Result<(), G::Error>
+fn run_node_group<G>(
+    mut node_group: LocalGossipNodeGroup<G, GossipSet<u128>, Message>,
+) -> Result<(), G::Error>
 where
     G: Gossip<Message, GossipSet<u128>>,
 {
-    while let Ok(message) = receiver.recv() {
+    while let Ok(envelope) = node_group.receiver.recv() {
+        let gossip = &mut node_group.gossips[envelope.node_index];
+        let message = envelope.message;
         match message.action {
             Action::GossipModifySet(_) => gossip.receive(&message)?,
             Action::ModifySet(v) => {
@@ -274,7 +285,7 @@ fn create_aggregator(args: &Args) -> Box<dyn Aggregator> {
     if args.primaries > 0 {
         Box::new(PreferentialGossipAggregator::new(args.primaries))
     } else {
-        Box::new(UniformGossipAggregator::default())
+        Box::<UniformGossipAggregator>::default()
     }
 }
 
@@ -293,7 +304,8 @@ enum WaitForElementOutcome {
 /// If `end_time` is reached before the element appears, we'll return with `EndTimeReached`.
 /// If `loss_timeout` passes before the element appears, we'll return with `Lost`.
 fn wait_for_element(
-    target_node: &mpsc::Sender<Message>,
+    target_node_sender: &mpsc::Sender<Envelope<Message>>,
+    target_node_index: usize,
     element: u128,
     end_time: Instant,
     loss_timeout: Option<Duration>,
@@ -304,11 +316,15 @@ fn wait_for_element(
     let loss_time = loss_timeout.map(|timeout| insertion_time + timeout);
     // Keep checking for the element in the target node until it appears
     loop {
-        target_node
-            .send(Message::new(Action::Query {
-                element,
-                answer: my_tx.clone(),
-            }))
+        let message = Message::new(Action::Query {
+            element,
+            answer: my_tx.clone(),
+        });
+        target_node_sender
+            .send(Envelope {
+                message,
+                node_index: target_node_index,
+            })
             .unwrap();
         // Don't wait for the answer beyond our end time
         let now = Instant::now();
@@ -339,16 +355,17 @@ fn wait_for_element(
     }
 }
 
-fn run_network<G>(network: Vec<LocalGossipNode<G, GossipSet<u128>, Message>>, args: Args)
+fn run_network<G>(network: Vec<LocalGossipNodeGroup<G, GossipSet<u128>, Message>>, args: Args)
 where
     G: Gossip<Message, GossipSet<u128>> + Send + 'static,
     G::Error: Send + Debug,
 {
-    let mut threads = Vec::with_capacity(network.len());
-    let mut senders = Vec::with_capacity(network.len());
-    for node in network.into_iter() {
-        senders.push(node.sender);
-        threads.push(spawn(move || run_node(node.gossip, node.receiver)))
+    let num_groups = network.len();
+    let mut threads = Vec::with_capacity(num_groups);
+    let mut senders = Vec::with_capacity(num_groups);
+    for group in network.into_iter() {
+        senders.push(group.sender.clone());
+        threads.push(spawn(move || run_node_group(group)))
     }
 
     info!("Running");
@@ -366,16 +383,28 @@ where
     while Instant::now() < end {
         // Generate a random element to insert, and choose a start and target node
         let element: u128 = thread_rng().gen();
-        let start_node = thread_rng().gen_range(0..senders.len());
-        let target_node = thread_rng().gen_range(0..senders.len());
+        let start_node = thread_rng().gen_range(0..args.nodes);
+        let target_node = thread_rng().gen_range(0..args.nodes);
+        let start_node_info = NodeGroupInfo::for_node(num_groups, start_node);
+        let target_node_info = NodeGroupInfo::for_node(num_groups, target_node);
         // Send the message to add the element
-        senders[start_node]
-            .send(Message::new(Action::ModifySet(GossipSetAction::Add(
-                element,
-            ))))
+        let message = Message::new(Action::ModifySet(GossipSetAction::Add(element)));
+        senders[start_node_info.group_index]
+            .send(Envelope {
+                message,
+                node_index: start_node_info.node_index,
+            })
             .unwrap();
         // Wait for the element to appear in the target
-        let outcome = wait_for_element(&senders[target_node], element, end, loss_timeout, &tx, &rx);
+        let outcome = wait_for_element(
+            &senders[target_node_info.group_index],
+            target_node_info.node_index,
+            element,
+            end,
+            loss_timeout,
+            &tx,
+            &rx,
+        );
         match outcome {
             WaitForElementOutcome::Appeared(latency) => {
                 aggregator.record_latency(start_node, target_node, latency)
@@ -392,7 +421,10 @@ where
 
     info!("Terminating");
     for sender in senders {
-        if let Err(e) = sender.send(Message::new(Action::Terminate)) {
+        if let Err(e) = sender.send(Envelope {
+            message: Message::new(Action::Terminate),
+            node_index: 0,
+        }) {
             // There's a race in the end when one node terminates and the other nodes try to gossip to it
             // then those nodes end up failing to send to that node and exit, so I can't send to them...
             // For that I just ignore errors at the end.
@@ -416,11 +448,21 @@ fn main() {
         .init()
         .unwrap();
     info!("Creating network");
+    let num_groups = num_cpus::get();
     if args.primaries == 0 {
-        run_network(uniform_local_gossip_set(args.nodes, args.fanout), args);
+        run_network(
+            uniform_local_gossip_set(args.nodes, num_groups, args.peers_per_node, args.fanout),
+            args,
+        );
     } else {
         run_network(
-            preferential_local_gossip_set(args.nodes, args.primaries, args.fanout),
+            preferential_local_gossip_set(
+                args.nodes,
+                num_groups,
+                args.peers_per_node,
+                args.primaries,
+                args.fanout,
+            ),
             args,
         );
     };

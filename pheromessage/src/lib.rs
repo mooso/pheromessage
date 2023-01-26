@@ -6,6 +6,7 @@ use std::{
 
 pub mod channel;
 pub mod data;
+pub mod multiplex;
 pub mod net;
 #[cfg(feature = "postcard")]
 pub mod postmessage;
