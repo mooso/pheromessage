@@ -8,6 +8,7 @@ use std::{
 };
 
 use clap::Parser;
+use hdrhistogram::Histogram;
 use log::{debug, info, LevelFilter};
 use pheromessage::{
     channel::{preferential_local_gossip_set, uniform_local_gossip_set, LocalGossipNode},
@@ -122,20 +123,45 @@ where
 }
 
 /// An aggregate of latency.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone)]
 struct LatencyAggregate {
     total_latency: Duration,
     num_elements: usize,
+    histogram: Histogram<u64>,
+}
+
+impl Default for LatencyAggregate {
+    fn default() -> Self {
+        Self {
+            total_latency: Default::default(),
+            num_elements: Default::default(),
+            histogram: Histogram::new_with_max(1024 * 1024, 2).unwrap(),
+        }
+    }
 }
 
 impl LatencyAggregate {
     pub fn add_point(&mut self, latency: Duration) {
         self.num_elements += 1;
         self.total_latency += latency;
+        self.histogram.record(latency.as_micros() as u64).unwrap();
     }
 
     pub fn mean_micros(&self) -> f64 {
         self.total_latency.as_micros() as f64 / self.num_elements as f64
+    }
+
+    pub fn percentiles(&self) -> String {
+        if self.num_elements == 0 {
+            return String::default();
+        }
+        format!(
+            "p50: {} us, p90: {} us, p99: {} us, p100: {} us",
+            self.histogram.value_at_percentile(50.),
+            self.histogram.value_at_percentile(90.),
+            self.histogram.value_at_percentile(99.),
+            self.histogram.value_at_percentile(100.)
+        )
     }
 }
 
@@ -153,7 +179,7 @@ trait Aggregator {
 }
 
 /// An aggregator for use with uniform gossip.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct UniformGossipAggregator {
     aggregate: LatencyAggregate,
     lost_elements: usize,
@@ -179,9 +205,10 @@ impl Aggregator for UniformGossipAggregator {
 
     fn log(&self) {
         info!(
-            "Inserted {} elements with an average latency of {:.2} us. {} elements lost ({:.2}%).",
+            "Inserted {} elements with an average latency of {:.2} us ({}). {} elements lost ({:.2}%).",
             self.aggregate.num_elements,
             self.aggregate.mean_micros(),
+            self.aggregate.percentiles(),
             self.lost_elements,
             lost_percent(self.lost_elements, self.aggregate.num_elements)
         );
@@ -189,7 +216,7 @@ impl Aggregator for UniformGossipAggregator {
 }
 
 /// An aggregator for use with preferential gossip.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 struct PreferentialGossipAggregator {
     primaries_aggregate: LatencyAggregate,
     secondaries_aggregate: LatencyAggregate,
@@ -229,10 +256,12 @@ impl Aggregator for PreferentialGossipAggregator {
 
     fn log(&self) {
         info!(
-            "Inserted {} elements. Primaries average latency is {:.2} us. Secondaries average latency is {:.2} us. Elements lost in: primaries {} ({:.2}%), secondaries {} ({:.2}%)",
+            "Inserted {} elements. Primaries average latency is {:.2} us ({}). Secondaries average latency is {:.2} us ({}). Elements lost in: primaries {} ({:.2}%), secondaries {} ({:.2}%)",
             self.primaries_aggregate.num_elements + self.secondaries_aggregate.num_elements,
             self.primaries_aggregate.mean_micros(),
+            self.primaries_aggregate.percentiles(),
             self.secondaries_aggregate.mean_micros(),
+            self.secondaries_aggregate.percentiles(),
             self.lost_in_primaries,
             lost_percent(self.lost_in_primaries, self.primaries_aggregate.num_elements),
             self.lost_in_secondaries,
