@@ -2,6 +2,8 @@
 
 use std::{
     fmt::Debug,
+    fs::OpenOptions,
+    io::prelude::*,
     sync::mpsc::{self, RecvTimeoutError},
     thread::spawn,
     time::{Duration, Instant},
@@ -19,6 +21,7 @@ use pheromessage::{
     Gossip, SharedData,
 };
 use rand::prelude::*;
+use serde_json::json;
 use simple_logger::SimpleLogger;
 
 /// Simulate a local gossip network maintaining a set where every node is a thread.
@@ -48,6 +51,10 @@ struct Args {
     /// If more than 0, then we'll declare a message lost if we don't see it in our target node after this many milliseconds.
     #[arg(short, long, default_value_t = 500)]
     lost_time_millis: u64,
+
+    /// If specified, statistics will be appended as a single JSON line to this file for this run.
+    #[arg(short, long)]
+    result_file: Option<String>,
 }
 
 /// The action that can be taken by each node upon receiving a message.
@@ -231,6 +238,7 @@ impl Aggregator for UniformGossipAggregator {
 struct PreferentialGossipAggregator {
     primaries_aggregate: LatencyAggregate,
     secondaries_aggregate: LatencyAggregate,
+    overall_aggregate: LatencyAggregate,
     num_primaries: usize,
     lost_in_primaries: usize,
     lost_in_secondaries: usize,
@@ -241,6 +249,7 @@ impl PreferentialGossipAggregator {
         PreferentialGossipAggregator {
             primaries_aggregate: Default::default(),
             secondaries_aggregate: Default::default(),
+            overall_aggregate: Default::default(),
             num_primaries,
             lost_in_primaries: 0,
             lost_in_secondaries: 0,
@@ -250,6 +259,7 @@ impl PreferentialGossipAggregator {
 
 impl Aggregator for PreferentialGossipAggregator {
     fn record_latency(&mut self, _source_index: usize, target_index: usize, latency: Duration) {
+        self.overall_aggregate.add_point(latency);
         if target_index < self.num_primaries {
             self.primaries_aggregate.add_point(latency);
         } else {
@@ -281,11 +291,90 @@ impl Aggregator for PreferentialGossipAggregator {
     }
 }
 
-fn create_aggregator(args: &Args) -> Box<dyn Aggregator> {
+enum MainAggregator {
+    Uniform(UniformGossipAggregator),
+    Preferential(PreferentialGossipAggregator),
+}
+
+struct EndResult {
+    overall_mean_latency_micros: f64,
+    overall_p50_latency_micros: u64,
+    overall_p99_latency_micros: u64,
+    primary_mean_latency_micros: Option<f64>,
+    primary_p50_latency_micros: Option<u64>,
+    primary_p99_latency_micros: Option<u64>,
+    secondary_mean_latency_micros: Option<f64>,
+    secondary_p50_latency_micros: Option<u64>,
+    secondary_p99_latency_micros: Option<u64>,
+}
+
+impl Aggregator for MainAggregator {
+    fn record_latency(&mut self, source_index: usize, target_index: usize, latency: Duration) {
+        match self {
+            MainAggregator::Uniform(a) => a.record_latency(source_index, target_index, latency),
+            MainAggregator::Preferential(a) => {
+                a.record_latency(source_index, target_index, latency)
+            }
+        }
+    }
+
+    fn record_loss(&mut self, source_index: usize, target_index: usize) {
+        match self {
+            MainAggregator::Uniform(a) => a.record_loss(source_index, target_index),
+            MainAggregator::Preferential(a) => a.record_loss(source_index, target_index),
+        }
+    }
+
+    fn log(&self) {
+        match self {
+            MainAggregator::Uniform(a) => a.log(),
+            MainAggregator::Preferential(a) => a.log(),
+        }
+    }
+}
+
+impl MainAggregator {
+    pub fn end_result(&self) -> EndResult {
+        match self {
+            MainAggregator::Uniform(a) => EndResult {
+                overall_mean_latency_micros: a.aggregate.mean_micros(),
+                overall_p50_latency_micros: a.aggregate.histogram.value_at_percentile(50.),
+                overall_p99_latency_micros: a.aggregate.histogram.value_at_percentile(9.),
+                primary_mean_latency_micros: None,
+                primary_p50_latency_micros: None,
+                primary_p99_latency_micros: None,
+                secondary_mean_latency_micros: None,
+                secondary_p50_latency_micros: None,
+                secondary_p99_latency_micros: None,
+            },
+            MainAggregator::Preferential(a) => EndResult {
+                overall_mean_latency_micros: a.overall_aggregate.mean_micros(),
+                overall_p50_latency_micros: a.overall_aggregate.histogram.value_at_percentile(50.),
+                overall_p99_latency_micros: a.overall_aggregate.histogram.value_at_percentile(99.),
+                primary_mean_latency_micros: Some(a.primaries_aggregate.mean_micros()),
+                primary_p50_latency_micros: Some(
+                    a.primaries_aggregate.histogram.value_at_percentile(50.),
+                ),
+                primary_p99_latency_micros: Some(
+                    a.primaries_aggregate.histogram.value_at_percentile(99.),
+                ),
+                secondary_mean_latency_micros: Some(a.secondaries_aggregate.mean_micros()),
+                secondary_p50_latency_micros: Some(
+                    a.secondaries_aggregate.histogram.value_at_percentile(50.),
+                ),
+                secondary_p99_latency_micros: Some(
+                    a.secondaries_aggregate.histogram.value_at_percentile(99.),
+                ),
+            },
+        }
+    }
+}
+
+fn create_aggregator(args: &Args) -> MainAggregator {
     if args.primaries > 0 {
-        Box::new(PreferentialGossipAggregator::new(args.primaries))
+        MainAggregator::Preferential(PreferentialGossipAggregator::new(args.primaries))
     } else {
-        Box::<UniformGossipAggregator>::default()
+        MainAggregator::Uniform(UniformGossipAggregator::default())
     }
 }
 
@@ -355,7 +444,10 @@ fn wait_for_element(
     }
 }
 
-fn run_network<G>(network: Vec<LocalGossipNodeGroup<G, GossipSet<u128>, Message>>, args: Args)
+fn run_network<G>(
+    network: Vec<LocalGossipNodeGroup<G, GossipSet<u128>, Message>>,
+    args: &Args,
+) -> MainAggregator
 where
     G: Gossip<Message, GossipSet<u128>> + Send + 'static,
     G::Error: Send + Debug,
@@ -437,6 +529,7 @@ where
             debug!("Error sending terminate signal: {:?}", e);
         }
     }
+    aggregator
 }
 
 fn main() {
@@ -449,11 +542,11 @@ fn main() {
         .unwrap();
     info!("Creating network");
     let num_groups = num_cpus::get();
-    if args.primaries == 0 {
+    let results = if args.primaries == 0 {
         run_network(
             uniform_local_gossip_set(args.nodes, num_groups, args.peers_per_node, args.fanout),
-            args,
-        );
+            &args,
+        )
     } else {
         run_network(
             preferential_local_gossip_set(
@@ -463,7 +556,32 @@ fn main() {
                 args.primaries,
                 args.fanout,
             ),
-            args,
-        );
+            &args,
+        )
     };
+    if let Some(result_file) = &args.result_file {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .write(true)
+            .create(true)
+            .open(result_file)
+            .unwrap();
+        let end_result = results.end_result();
+        let result_json = json!({
+            "nodes": args.nodes,
+            "fanout": args.fanout,
+            "peers_per_node": args.peers_per_node,
+            "primaries": args.primaries,
+            "overall_mean": end_result.overall_mean_latency_micros,
+            "overall_p50": end_result.overall_p50_latency_micros,
+            "overall_p99": end_result.overall_p99_latency_micros,
+            "primary_mean": end_result.primary_mean_latency_micros,
+            "primary_p50": end_result.primary_p50_latency_micros,
+            "primary_p99": end_result.primary_p99_latency_micros,
+            "secondary_mean": end_result.secondary_mean_latency_micros,
+            "secondary_p50": end_result.secondary_p50_latency_micros,
+            "secondary_p99": end_result.secondary_p99_latency_micros,
+        });
+        writeln!(file, "{}", result_json.to_string()).unwrap();
+    }
 }
