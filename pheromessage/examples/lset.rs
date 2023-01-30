@@ -339,7 +339,7 @@ impl MainAggregator {
             MainAggregator::Uniform(a) => EndResult {
                 overall_mean_latency_micros: a.aggregate.mean_micros(),
                 overall_p50_latency_micros: a.aggregate.histogram.value_at_percentile(50.),
-                overall_p99_latency_micros: a.aggregate.histogram.value_at_percentile(9.),
+                overall_p99_latency_micros: a.aggregate.histogram.value_at_percentile(99.),
                 primary_mean_latency_micros: None,
                 primary_p50_latency_micros: None,
                 primary_p99_latency_micros: None,
