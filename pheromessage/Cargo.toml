@@ -21,6 +21,7 @@ name = "lset"
 rayon = { version = "1" }
 clap = { version = "4.1", features = ["derive"] }
 hdrhistogram = { version = "7" }
+itertools = { version = "0" }
 log = { version = "0.4" }
 num_cpus = { version = "1" }
 serde_json = { version = "1" }

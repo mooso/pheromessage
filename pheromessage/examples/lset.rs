@@ -1,6 +1,7 @@
 //! Driver for running a local network of gossip nodes as threads that talk to each other.
 
 use std::{
+    collections::HashMap,
     fmt::Debug,
     fs::OpenOptions,
     io::prelude::*,
@@ -11,6 +12,7 @@ use std::{
 
 use clap::Parser;
 use hdrhistogram::Histogram;
+use itertools::Itertools;
 use log::{debug, info, LevelFilter};
 use pheromessage::{
     data::{GossipSet, GossipSetAction},
@@ -298,14 +300,11 @@ enum MainAggregator {
 
 struct EndResult {
     overall_mean_latency_micros: f64,
-    overall_p50_latency_micros: u64,
-    overall_p99_latency_micros: u64,
+    overall_percentile_latency_micros: HashMap<u8, u64>,
     primary_mean_latency_micros: Option<f64>,
-    primary_p50_latency_micros: Option<u64>,
-    primary_p99_latency_micros: Option<u64>,
+    primary_percentile_latency_micros: Option<HashMap<u8, u64>>,
     secondary_mean_latency_micros: Option<f64>,
-    secondary_p50_latency_micros: Option<u64>,
-    secondary_p99_latency_micros: Option<u64>,
+    secondary_percentile_latency_micros: Option<HashMap<u8, u64>>,
 }
 
 impl Aggregator for MainAggregator {
@@ -333,38 +332,36 @@ impl Aggregator for MainAggregator {
     }
 }
 
+fn get_percentiles(histogram: &Histogram<u64>) -> HashMap<u8, u64> {
+    let mut percentiles = HashMap::new();
+    for p in [50, 90, 99] {
+        percentiles.insert(p, histogram.value_at_percentile(p as f64));
+    }
+    percentiles
+}
+
 impl MainAggregator {
     pub fn end_result(&self) -> EndResult {
         match self {
             MainAggregator::Uniform(a) => EndResult {
                 overall_mean_latency_micros: a.aggregate.mean_micros(),
-                overall_p50_latency_micros: a.aggregate.histogram.value_at_percentile(50.),
-                overall_p99_latency_micros: a.aggregate.histogram.value_at_percentile(99.),
+                overall_percentile_latency_micros: get_percentiles(&a.aggregate.histogram),
                 primary_mean_latency_micros: None,
-                primary_p50_latency_micros: None,
-                primary_p99_latency_micros: None,
+                primary_percentile_latency_micros: None,
                 secondary_mean_latency_micros: None,
-                secondary_p50_latency_micros: None,
-                secondary_p99_latency_micros: None,
+                secondary_percentile_latency_micros: None,
             },
             MainAggregator::Preferential(a) => EndResult {
                 overall_mean_latency_micros: a.overall_aggregate.mean_micros(),
-                overall_p50_latency_micros: a.overall_aggregate.histogram.value_at_percentile(50.),
-                overall_p99_latency_micros: a.overall_aggregate.histogram.value_at_percentile(99.),
+                overall_percentile_latency_micros: get_percentiles(&a.overall_aggregate.histogram),
                 primary_mean_latency_micros: Some(a.primaries_aggregate.mean_micros()),
-                primary_p50_latency_micros: Some(
-                    a.primaries_aggregate.histogram.value_at_percentile(50.),
-                ),
-                primary_p99_latency_micros: Some(
-                    a.primaries_aggregate.histogram.value_at_percentile(99.),
-                ),
+                primary_percentile_latency_micros: Some(get_percentiles(
+                    &a.primaries_aggregate.histogram,
+                )),
                 secondary_mean_latency_micros: Some(a.secondaries_aggregate.mean_micros()),
-                secondary_p50_latency_micros: Some(
-                    a.secondaries_aggregate.histogram.value_at_percentile(50.),
-                ),
-                secondary_p99_latency_micros: Some(
-                    a.secondaries_aggregate.histogram.value_at_percentile(99.),
-                ),
+                secondary_percentile_latency_micros: Some(get_percentiles(
+                    &a.secondaries_aggregate.histogram,
+                )),
             },
         }
     }
@@ -471,7 +468,7 @@ where
     let log_period = Duration::from_secs(1); // How long to wait between log messages
     let mut next_log_target = start + log_period;
     let end = start + Duration::from_secs(args.time);
-    let mut aggregator = create_aggregator(&args);
+    let mut aggregator = create_aggregator(args);
     while Instant::now() < end {
         // Generate a random element to insert, and choose a start and target node
         let element: u128 = thread_rng().gen();
@@ -532,6 +529,16 @@ where
     aggregator
 }
 
+fn add_percentiles(json: &mut serde_json::Value, prefix: &str, percentiles: &HashMap<u8, u64>) {
+    let json = json.as_object_mut().unwrap();
+    for (&k, &v) in percentiles.iter().sorted_by_key(|(&k, _)| k) {
+        json.insert(
+            format!("{prefix}_p{k}"),
+            serde_json::Value::Number(serde_json::Number::from(v)),
+        );
+    }
+}
+
 fn main() {
     let args = Args::parse();
     SimpleLogger::new()
@@ -567,21 +574,26 @@ fn main() {
             .open(result_file)
             .unwrap();
         let end_result = results.end_result();
-        let result_json = json!({
+        let mut result_json = json!({
             "nodes": args.nodes,
             "fanout": args.fanout,
             "peers_per_node": args.peers_per_node,
             "primaries": args.primaries,
             "overall_mean": end_result.overall_mean_latency_micros,
-            "overall_p50": end_result.overall_p50_latency_micros,
-            "overall_p99": end_result.overall_p99_latency_micros,
             "primary_mean": end_result.primary_mean_latency_micros,
-            "primary_p50": end_result.primary_p50_latency_micros,
-            "primary_p99": end_result.primary_p99_latency_micros,
             "secondary_mean": end_result.secondary_mean_latency_micros,
-            "secondary_p50": end_result.secondary_p50_latency_micros,
-            "secondary_p99": end_result.secondary_p99_latency_micros,
         });
-        writeln!(file, "{}", result_json.to_string()).unwrap();
+        add_percentiles(
+            &mut result_json,
+            "overall",
+            &end_result.overall_percentile_latency_micros,
+        );
+        if let Some(primary) = &end_result.primary_percentile_latency_micros {
+            add_percentiles(&mut result_json, "primary", primary);
+        }
+        if let Some(secondary) = &end_result.secondary_percentile_latency_micros {
+            add_percentiles(&mut result_json, "secondary", secondary);
+        }
+        writeln!(file, "{result_json}").unwrap();
     }
 }
